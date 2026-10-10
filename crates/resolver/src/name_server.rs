@@ -345,25 +345,42 @@ impl<P: ConnectionProvider> NameServer<P> {
             }
         }
 
-        // Select connection config and update transport state (no lock)
+        // Select a connection config and, with opportunistic encryption, either record the
+        // connection attempt or decide whether to probe, all under a single transport state lock.
         debug!(config = ?self.config, "connecting");
-        let config = policy
-            .select_connection_config(
-                self.config.ip,
-                &*cx.transport_state().await,
-                &cx.opportunistic_encryption,
-                &self.config.connections,
-            )
-            .ok_or((NetError::NoConnections, None))?;
+        let opportunistic_encryption = &cx.opportunistic_encryption;
+        let (config, probe_config) = {
+            let mut state = cx.transport_state().await;
+            let config = policy
+                .select_connection_config(
+                    self.config.ip,
+                    &state,
+                    opportunistic_encryption,
+                    &self.config.connections,
+                )
+                .ok_or((NetError::NoConnections, None))?;
+
+            let protocol = config.protocol.to_protocol();
+            let probe_config = if !opportunistic_encryption.is_enabled() {
+                None
+            } else if protocol.is_encrypted() {
+                state.initiate_connection(self.config.ip, protocol);
+                None
+            } else {
+                self.encrypted_probe_config(&policy, &state, opportunistic_encryption)
+            };
+
+            (config, probe_config)
+        };
+
+        // The probe updates the transport state itself, so start it after releasing the lock.
+        if let Some(probe_config) = probe_config {
+            if let Err(err) = self.probe_encrypted_transport(cx, probe_config) {
+                error!(%err, "opportunistic encrypted probe attempt failed");
+            }
+        }
 
         let protocol = config.protocol.to_protocol();
-        if cx.opportunistic_encryption.is_enabled() && protocol.is_encrypted() {
-            cx.transport_state()
-                .await
-                .initiate_connection(self.config.ip, protocol);
-        } else if cx.opportunistic_encryption.is_enabled() && !protocol.is_encrypted() {
-            self.consider_probe_encrypted_transport(&policy, cx).await;
-        }
 
         // Establish connection
         let meta = self.meta(protocol);
@@ -478,35 +495,28 @@ impl<P: ConnectionProvider> NameServer<P> {
         self.config.trust_negative_responses
     }
 
-    async fn consider_probe_encrypted_transport(
+    /// Returns the encrypted connection config to probe, if the RFC 9539 damping logic in the
+    /// transport `state` allows a probe for this server.
+    fn encrypted_probe_config(
         &self,
         policy: &ConnectionPolicy,
-        cx: &Arc<PoolContext>,
-    ) {
+        state: &NameServerTransportState,
+        opportunistic_encryption: &OpportunisticEncryption,
+    ) -> Option<&ConnectionConfig> {
         let Some(probe_config) =
             policy.select_encrypted_connection_config(&self.config.connections)
         else {
             warn!("no encrypted connection configs available for probing");
-            return;
+            return None;
         };
 
-        let probe_protocol = probe_config.protocol.to_protocol();
-        let should_probe = {
-            let state = cx.transport_state().await;
-            state.should_probe_encrypted(
+        state
+            .should_probe_encrypted(
                 self.config.ip,
-                probe_protocol,
-                &cx.opportunistic_encryption,
+                probe_config.protocol.to_protocol(),
+                opportunistic_encryption,
             )
-        };
-
-        if !should_probe {
-            return;
-        }
-
-        if let Err(err) = self.probe_encrypted_transport(cx, probe_config) {
-            error!(%err, "opportunistic encrypted probe attempt failed");
-        }
+            .then_some(probe_config)
     }
 
     fn probe_encrypted_transport(
