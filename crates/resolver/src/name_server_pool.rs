@@ -938,7 +938,9 @@ mod opportunistic_encryption_persistence {
             loop {
                 T::delay_for(*save_interval).await;
                 trace!(path = %path.display(), ?save_interval, "persisting opportunistic encryption state");
-                if let Err(e) = self.save(&*cx.transport_state.lock().await) {
+                // Snapshot the state so that queries aren't blocked on the file I/O below.
+                let state = cx.transport_state.lock().await.clone();
+                if let Err(e) = self.save(&state) {
                     error!("failed to save opportunistic encryption state: {e}");
                 }
             }
