@@ -312,6 +312,15 @@ impl<P: ConnectionProvider> NameServer<P> {
         policy: ConnectionPolicy,
         cx: &Arc<PoolContext>,
     ) -> Result<ConnectedClient<P>, (NetError, Option<Protocol>)> {
+        // Consult the pool-wide transport state before taking the per-server lock, so that
+        // `self.connections` is never held while waiting for `cx.transport_state`. The
+        // transport state is only relevant when opportunistic encryption is enabled.
+        let encrypted_recent_success = cx.opportunistic_encryption.is_enabled()
+            && cx
+                .transport_state()
+                .await
+                .any_recent_success(self.config.ip, &cx.opportunistic_encryption);
+
         // Check for an existing usable connection (short lock)
         {
             let mut connections = self.connections.lock().await;
@@ -323,8 +332,7 @@ impl<P: ConnectionProvider> NameServer<P> {
             });
 
             if let Some(conn) = policy.select_connection(
-                self.config.ip,
-                &*cx.transport_state().await,
+                encrypted_recent_success,
                 &cx.opportunistic_encryption,
                 &connections,
             ) {
@@ -907,10 +915,12 @@ impl ConnectionPolicy {
     ///
     /// This choice is made based on opportunistic encryption policy & probe history,
     /// protocol policy, and the SRTT performance metrics.
+    ///
+    /// `encrypted_recent_success` indicates whether any supported encrypted protocol recently
+    /// succeeded for this server (see [`NameServerTransportState::any_recent_success`]).
     fn select_connection<'a, P: ConnectionProvider>(
         &self,
-        ip: IpAddr,
-        encrypted_transport_state: &NameServerTransportState,
+        encrypted_recent_success: bool,
         opportunistic_encryption: &OpportunisticEncryption,
         connections: &'a [ConnectionState<P>],
     ) -> Option<&'a ConnectionState<P>> {
@@ -928,7 +938,7 @@ impl ConnectionPolicy {
         // re-use.
         match opportunistic_encryption.is_enabled()
             && !selected.protocol.is_encrypted()
-            && encrypted_transport_state.any_recent_success(ip, opportunistic_encryption)
+            && encrypted_recent_success
         {
             true => None,
             false => Some(selected),
@@ -1338,9 +1348,11 @@ mod tests {
 mod opportunistic_enc_tests {
     use std::io;
     use std::net::{IpAddr, Ipv4Addr};
+    use std::pin::pin;
     use std::sync::Arc;
     use std::time::{Duration, SystemTime};
 
+    use futures_util::FutureExt;
     #[cfg(feature = "metrics")]
     use metrics::{Label, Unit, with_local_recorder};
     #[cfg(feature = "metrics")]
@@ -1361,7 +1373,8 @@ mod opportunistic_enc_tests {
         PROBE_SUCCESSES_TOTAL, PROBE_TIMEOUTS_TOTAL,
     };
     use crate::name_server::{
-        ConnectionMeta, ConnectionPolicy, ConnectionState, NameServer, mock_provider,
+        ConnectedClient, ConnectionMeta, ConnectionPolicy, ConnectionReuse, ConnectionState,
+        NameServer, mock_provider,
     };
     use crate::name_server_pool::{NameServerTransportState, PoolContext};
     use crate::net::NetError;
@@ -1381,14 +1394,22 @@ mod opportunistic_enc_tests {
 
         // When opportunistic encryption is disabled, and disable_udp isn't active,
         // we should select the UDP conn.
-        let selected = policy.select_connection(ns_ip, &state, &opp_enc, &connections);
+        let selected = policy.select_connection(
+            state.any_recent_success(ns_ip, &opp_enc),
+            &opp_enc,
+            &connections,
+        );
         assert!(selected.is_some());
         assert_eq!(selected.unwrap().protocol, Protocol::Udp);
 
         // When opportunistic encryption is disabled, and disable_udp is active,
         // we should select the TCP conn.
         policy.disable_udp = true;
-        let selected = policy.select_connection(ns_ip, &state, &opp_enc, &connections);
+        let selected = policy.select_connection(
+            state.any_recent_success(ns_ip, &opp_enc),
+            &opp_enc,
+            &connections,
+        );
         assert!(selected.is_some());
         assert_eq!(selected.unwrap().protocol, Protocol::Tcp);
     }
@@ -1411,7 +1432,11 @@ mod opportunistic_enc_tests {
 
         // When opportunistic encryption is enabled, and there is an encrypted connection available,
         // we should always choose it as the most preferred.
-        let selected = policy.select_connection(ns_ip, &state, opp_enc, &connections);
+        let selected = policy.select_connection(
+            state.any_recent_success(ns_ip, opp_enc),
+            opp_enc,
+            &connections,
+        );
         assert!(selected.is_some());
         assert_eq!(selected.unwrap().protocol, Protocol::Tls);
     }
@@ -1433,14 +1458,22 @@ mod opportunistic_enc_tests {
 
         // When opportunistic encryption is enabled, but there are no encrypted connections available,
         // and we have no probe state, we should select the UDP conn.
-        let selected = policy.select_connection(ns_ip, &state, opp_enc, &connections);
+        let selected = policy.select_connection(
+            state.any_recent_success(ns_ip, opp_enc),
+            opp_enc,
+            &connections,
+        );
         assert!(selected.is_some());
         assert_eq!(selected.unwrap().protocol, Protocol::Udp);
 
         // When opportunistic encryption is enabled, but there are no encrypted connections available,
         // and we have no probe state, we should select the TCP conn.
         policy.disable_udp = true;
-        let selected = policy.select_connection(ns_ip, &state, opp_enc, &connections);
+        let selected = policy.select_connection(
+            state.any_recent_success(ns_ip, opp_enc),
+            opp_enc,
+            &connections,
+        );
         assert!(selected.is_some());
         assert_eq!(selected.unwrap().protocol, Protocol::Tcp);
     }
@@ -1472,7 +1505,11 @@ mod opportunistic_enc_tests {
 
         // When opportunistic encryption is enabled, but there are no encrypted connections available,
         // and our probe state indicates a failure, we should select the UDP conn.
-        let selected = policy.select_connection(ns_ip, &state, opp_enc, &connections);
+        let selected = policy.select_connection(
+            state.any_recent_success(ns_ip, opp_enc),
+            opp_enc,
+            &connections,
+        );
         assert!(selected.is_some());
         assert_eq!(selected.unwrap().protocol, Protocol::Udp);
     }
@@ -1497,7 +1534,11 @@ mod opportunistic_enc_tests {
 
         // When opportunistic encryption is enabled, but there are no encrypted connections available,
         // and our probe state indicates an in-flight probe, we should select the UDP conn.
-        let selected = policy.select_connection(ns_ip, &state, opp_enc, &connections);
+        let selected = policy.select_connection(
+            state.any_recent_success(ns_ip, opp_enc),
+            opp_enc,
+            &connections,
+        );
         assert!(selected.is_some());
         assert_eq!(selected.unwrap().protocol, Protocol::Udp);
 
@@ -1506,7 +1547,11 @@ mod opportunistic_enc_tests {
         state.complete_connection(ns_ip, Protocol::Tls);
 
         // In this case we should still select the UDP conn.
-        let selected = policy.select_connection(ns_ip, &state, opp_enc, &connections);
+        let selected = policy.select_connection(
+            state.any_recent_success(ns_ip, opp_enc),
+            opp_enc,
+            &connections,
+        );
         assert!(selected.is_some());
         assert_eq!(selected.unwrap().protocol, Protocol::Udp);
     }
@@ -1541,7 +1586,11 @@ mod opportunistic_enc_tests {
         // When opportunistic encryption is enabled, but there are no encrypted connections available,
         // and our probe state indicates success that is too stale, we should select an unencrypted
         // connection since the probe is no longer considered recent.
-        let selected = policy.select_connection(ns_ip, &state, opp_enc, &connections);
+        let selected = policy.select_connection(
+            state.any_recent_success(ns_ip, opp_enc),
+            opp_enc,
+            &connections,
+        );
         assert!(selected.is_some());
         assert_eq!(selected.unwrap().protocol, Protocol::Udp);
     }
@@ -1569,7 +1618,11 @@ mod opportunistic_enc_tests {
         // When opportunistic encryption is enabled, but there are no encrypted connections available,
         // and our probe state indicates a recent enough success, we should return `None` so that
         // we make a new encrypted connection.
-        let selected = policy.select_connection(ns_ip, &state, opp_enc, &connections);
+        let selected = policy.select_connection(
+            state.any_recent_success(ns_ip, opp_enc),
+            opp_enc,
+            &connections,
+        );
         assert!(selected.is_none());
     }
 
@@ -1864,6 +1917,77 @@ mod opportunistic_enc_tests {
         let (ip, protocol) = &recorded_calls[0];
         assert_eq!(*ip, ns_ip);
         assert_eq!(protocol.to_protocol(), Protocol::Udp);
+    }
+
+    /// A query that is waiting for the pool-wide transport state must not hold the name server's
+    /// own connection lock while doing so.
+    #[tokio::test]
+    async fn test_connections_unlocked_while_waiting_for_transport_state() {
+        subscribe();
+
+        let ns_ip = IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1));
+        let cx = Arc::new(
+            PoolContext::new(ResolverOpts::default(), TlsConfig::new().unwrap())
+                .with_opportunistic_encryption()
+                .with_probe_budget(10),
+        );
+        let name_server = NameServer::new(
+            [],
+            NameServerConfig::opportunistic_encryption(ns_ip),
+            &ResolverOpts::default(),
+            MockProvider::default(),
+        );
+
+        // Hold the transport state lock, as a concurrent query or the persistence task might.
+        let transport_state = cx.transport_state().await;
+        let mut connect = pin!(name_server.connected_mut_client(ConnectionPolicy::default(), &cx));
+        assert!(connect.as_mut().now_or_never().is_none());
+        assert!(
+            name_server.connections.try_lock().is_some(),
+            "connections lock held while waiting for the transport state lock"
+        );
+
+        drop(transport_state);
+        assert!(connect.await.is_ok());
+    }
+
+    /// Without opportunistic encryption, reusing an existing connection does not need the
+    /// pool-wide transport state at all.
+    #[tokio::test]
+    async fn test_reuse_without_opportunistic_encryption_skips_transport_state() {
+        subscribe();
+
+        let ns_ip = IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1));
+        let cx = Arc::new(PoolContext::new(
+            ResolverOpts::default(),
+            TlsConfig::new().unwrap(),
+        ));
+        let name_server = NameServer::new(
+            [],
+            NameServerConfig::udp(ns_ip),
+            &ResolverOpts::default(),
+            MockProvider::default(),
+        );
+
+        // Establish a connection to reuse.
+        assert!(
+            name_server
+                .connected_mut_client(ConnectionPolicy::default(), &cx)
+                .await
+                .is_ok()
+        );
+
+        let _transport_state = cx.transport_state().await;
+        let reused = name_server
+            .connected_mut_client(ConnectionPolicy::default(), &cx)
+            .now_or_never();
+        assert!(matches!(
+            reused,
+            Some(Ok(ConnectedClient {
+                reuse: ConnectionReuse::Reused,
+                ..
+            }))
+        ));
     }
 
     fn mock_connection(protocol: Protocol) -> ConnectionState<MockProvider> {
